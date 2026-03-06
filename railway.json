@@ -1,0 +1,479 @@
+console.log("SERVER VERSION: barons-redesign-v1");
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io'
+import crypto from 'crypto';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+import { newGameState, startNextRound, resolveRound, roll2d6, deepCopy } from './gameEngine.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*' },
+});
+
+const PORT = process.env.PORT || 8080;
+
+const publicDir = path.join(__dirname, 'public');
+const fallbackClientDir = path.join(__dirname, '..', 'client');
+
+app.use(express.static(publicDir));
+app.use(express.static(fallbackClientDir));
+
+app.get('*', (req, res) => {
+  const indexFromPublic = path.join(publicDir, 'index.html');
+  const indexFromFallback = path.join(fallbackClientDir, 'index.html');
+  res.sendFile(indexFromPublic, (err) => {
+    if (err) res.sendFile(indexFromFallback);
+  });
+});
+
+const rooms = new Map();
+
+function makeRoomId() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for (let i = 0; i < 5; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return s;
+}
+
+function makeSecret() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// Change 7: starting money = $1000 × number of players
+function getStartingMoney(nPlayers) {
+  return 1000 * nPlayers;
+}
+
+function publicStateFor(socket, state) {
+  const isAdmin = socket.data?.isAdmin === true;
+  const viewerPlayerId = socket.data?.playerId;
+
+  const s = deepCopy(state);
+  delete s.adminSecret;
+
+  const researched = new Set();
+  if (!isAdmin && viewerPlayerId) {
+    const me = s.players.find(p => p.id === viewerPlayerId);
+    const log = Array.isArray(me?.round?.researchLog) ? me.round.researchLog : [];
+    for (const entry of log) {
+      if (entry?.projectId != null) researched.add(String(entry.projectId));
+    }
+  }
+
+  s.round.projects = s.round.projects.map(p => {
+    const proj = { ...p };
+    if (!isAdmin) {
+      proj.modifier = { id: 'face_down', name: 'Face-down Modifier', type: 'Hidden' };
+      if (researched.has(String(p.id))) proj.modifier = p.modifier;
+      if (s.round.lastResolution) {
+        const r = s.round.lastResolution.perProject?.find(x => String(x.projectId) === String(p.id));
+        if (r?.modifier) proj.modifier = r.modifier;
+      }
+    }
+    return proj;
+  });
+
+  s.players = s.players.map(p => {
+    const pp = { ...p };
+    if (!isAdmin && p.id !== viewerPlayerId) {
+      pp.round = {
+        investmentsSubmitted: !!p.round?.investmentsSubmitted,
+        boughtInsurance: !!p.round?.boughtInsurance,
+        researchPurchases: p.round?.researchPurchases || 0,
+      };
+    }
+    return pp;
+  });
+
+  return s;
+}
+
+function emitState(roomId) {
+  const state = rooms.get(roomId);
+  if (!state) return;
+  const sockets = io.sockets.adapter.rooms.get(roomId);
+  if (!sockets) return;
+  for (const sid of sockets) {
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock) continue;
+    sock.emit('state', publicStateFor(sock, state));
+  }
+}
+
+io.on('connection', (socket) => {
+
+  socket.on('rejoin_room', ({ roomId, playerId, adminSecret } = {}, cb) => {
+    roomId = (roomId || '').toUpperCase().trim();
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+
+    if (adminSecret && adminSecret === state.adminSecret) {
+      socket.data.isAdmin = true;
+      socket.data.adminSecret = adminSecret;
+      socket.data.playerId = null;
+      cb?.({ ok: true, role: 'admin' });
+      socket.emit('state', publicStateFor(socket, state));
+      return;
+    }
+
+    if (playerId) {
+      const player = state.players.find(p => p.id === playerId);
+      if (!player) return cb?.({ ok: false, error: 'Player not found in room' });
+      socket.data.isAdmin = false;
+      socket.data.playerId = playerId;
+      cb?.({ ok: true, role: 'player' });
+      socket.emit('state', publicStateFor(socket, state));
+      return;
+    }
+
+    cb?.({ ok: false, error: 'No credentials provided' });
+  });
+
+  socket.on('create_room', ({ adminName, seed } = {}, cb) => {
+    const roomId = makeRoomId();
+    const secret = makeSecret();
+    const state = newGameState({ roomId, adminSecret: secret, seed: seed ?? null });
+    state.admin = { name: adminName || 'Admin' };
+    rooms.set(roomId, state);
+
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+    socket.data.isAdmin = true;
+    socket.data.adminSecret = secret;
+
+    cb?.({ roomId, adminSecret: secret });
+    emitState(roomId);
+  });
+
+  socket.on('join_room', ({ roomId, name, adminSecret } = {}, cb) => {
+    roomId = (roomId || '').toUpperCase().trim();
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+
+    if (adminSecret && adminSecret === state.adminSecret) {
+      socket.data.isAdmin = true;
+      socket.data.adminSecret = adminSecret;
+      cb?.({ ok: true, role: 'admin' });
+      emitState(roomId);
+      return;
+    }
+
+    // Change 7: starting money based on current player count (after adding this player)
+    const nPlayersAfter = state.players.length + 1;
+    const startingMoney = getStartingMoney(nPlayersAfter);
+
+    // Update all existing players' starting money to match new count
+    for (const p of state.players) {
+      const oldStart = p.startingMoney ?? p.money;
+      const newStart = startingMoney;
+      if (oldStart !== newStart) {
+        // Adjust money proportionally only if game hasn't started (round 0)
+        if (state.round.number === 0) {
+          p.money = newStart;
+          p.startingMoney = newStart;
+        }
+      }
+    }
+
+    const id = crypto.randomBytes(8).toString('hex');
+    const player = {
+      id,
+      name: (name || 'Player').slice(0, 24),
+      money: startingMoney,
+      startingMoney,
+      round: {
+        investments: {},
+        investmentsSubmitted: false,
+        researchPurchases: 0,
+        boughtInsurance: false,
+        researchLog: [],
+      },
+    };
+
+    state.players.push(player);
+    socket.data.playerId = id;
+    socket.data.isAdmin = false;
+
+    cb?.({ ok: true, role: 'player', playerId: id });
+    state.log.push({ t: Date.now(), type: 'JOIN', msg: `${player.name} joined` });
+    emitState(roomId);
+  });
+
+  // ── ADMIN ACTIONS ──────────────────────────────────────────────────────────
+
+  socket.on('admin_start_round', ({}, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+
+    try {
+      const next = startNextRound(state);
+      rooms.set(roomId, next);
+      cb?.({ ok: true });
+      emitState(roomId);
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on('admin_set_phase', ({ phase }, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+
+    state.round.phase = phase;
+    state.log.push({ t: Date.now(), type: 'PHASE', msg: `Phase -> ${phase}` });
+    cb?.({ ok: true });
+    emitState(roomId);
+  });
+
+  // ── PLAYER ACTIONS ─────────────────────────────────────────────────────────
+
+  // Change 6: research costs $100 and reveals 1 project
+  socket.on('player_buy_research', ({ projectIds }, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+
+    const playerId = socket.data.playerId;
+    if (!playerId) return cb?.({ ok: false, error: 'Players only' });
+    if (state.round.phase !== 'RESEARCH') return cb?.({ ok: false, error: 'Not in research phase' });
+
+    const p = state.players.find(x => x.id === playerId);
+    if (!p) return cb?.({ ok: false, error: 'Player not found' });
+
+    // Change 6: accept a single project id (or first of array)
+    const picks = Array.isArray(projectIds) ? projectIds.slice(0, 1) : [projectIds];
+    const pid = String(picks[0]);
+    if (!pid) return cb?.({ ok: false, error: 'Pick a project to research' });
+
+    const proj = state.round.projects.find(x => String(x.id) === pid);
+    if (!proj) return cb?.({ ok: false, error: 'Project not found' });
+
+    // Change 5: deduct $100 immediately from player money
+    const researchCost = 100;
+    if (p.money < researchCost) return cb?.({ ok: false, error: 'Not enough money' });
+
+    p.money -= researchCost;
+    p.round.researchLog = Array.isArray(p.round.researchLog) ? p.round.researchLog : [];
+    p.round.researchPurchases = (p.round.researchPurchases || 0) + 1;
+
+    const entry = {
+      t: Date.now(),
+      kind: 'RESEARCH',
+      projectId: String(proj.id),
+      projectName: proj.name,
+      modifier: proj.modifier,
+    };
+    p.round.researchLog.push(entry);
+
+    const revealed = [{
+      projectId: entry.projectId,
+      projectName: entry.projectName,
+      modifier: {
+        id: entry.modifier.id,
+        name: entry.modifier.name,
+        type: entry.modifier.type,
+        text: entry.modifier.text,
+      },
+    }];
+
+    cb?.({ ok: true, revealed });
+    state.log.push({ t: Date.now(), type: 'RESEARCH', msg: `${p.name} bought research (-$${researchCost})` });
+    emitState(roomId);
+  });
+
+  // Change 5: deduct insurance cost immediately when toggled on
+  socket.on('player_buy_insurance', ({ buy }, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+
+    const playerId = socket.data.playerId;
+    if (!playerId) return cb?.({ ok: false, error: 'Players only' });
+    if (state.round.phase !== 'INSURANCE') return cb?.({ ok: false, error: 'Not in insurance phase' });
+
+    const p = state.players.find(x => x.id === playerId);
+    if (!p) return cb?.({ ok: false, error: 'Player not found' });
+
+    const alreadyBought = !!p.round.boughtInsurance;
+    const insuranceCost = 300;
+
+    if (buy && !alreadyBought) {
+      // Buying insurance: deduct immediately
+      if (p.money < insuranceCost) return cb?.({ ok: false, error: 'Not enough money for insurance' });
+      p.money -= insuranceCost;
+      p.round.boughtInsurance = true;
+      p.round.insurancePaid = true;
+    } else if (!buy && alreadyBought) {
+      // Cancelling insurance: refund immediately
+      p.money += insuranceCost;
+      p.round.boughtInsurance = false;
+      p.round.insurancePaid = false;
+    }
+
+    cb?.({ ok: true });
+    state.log.push({ t: Date.now(), type: 'INSURANCE', msg: `${p.name} insurance: ${buy ? 'BOUGHT (-$300)' : 'CANCELLED (+$300 refunded)'}` });
+    emitState(roomId);
+  });
+
+  // Change 8: simultaneous investments — store but do NOT block or override others
+  socket.on('player_submit_investments', ({ investments }, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+
+    const playerId = socket.data.playerId;
+    if (!playerId) return cb?.({ ok: false, error: 'Players only' });
+    if (state.round.phase !== 'INVEST') return cb?.({ ok: false, error: 'Not in investment phase' });
+
+    const p = state.players.find(x => x.id === playerId);
+    if (!p) return cb?.({ ok: false, error: 'Player not found' });
+
+    const inv = investments || {};
+    let total = 0;
+    const cleaned = {};
+
+    for (const proj of state.round.projects) {
+      const amt = Number(inv[proj.id] || 0);
+      if (!amt) continue;
+      if (amt < 0) return cb?.({ ok: false, error: 'Negative investment' });
+      if (amt % 100 !== 0) return cb?.({ ok: false, error: 'Investments must be in $100 increments' });
+      cleaned[proj.id] = amt;
+      total += amt;
+    }
+
+    // Change 5 & 8: available = current money (research and insurance already deducted from p.money)
+    // Note: insuranceCost is already deducted from p.money in real-time, so don't double-count
+    const available = p.money;
+    if (total > available) {
+      return cb?.({ ok: false, error: `Total investments ($${total}) exceed available funds ($${available})` });
+    }
+
+    // Change 8: simply store this player's investments; do NOT touch other players' state
+    p.round.investments = cleaned;
+    p.round.investmentsSubmitted = true;
+
+    cb?.({ ok: true });
+    state.log.push({ t: Date.now(), type: 'INVEST', msg: `${p.name} submitted investments` });
+    // Change 8: emit state to everyone — each player sees their own form data preserved client-side
+    emitState(roomId);
+  });
+
+  socket.on('admin_roll_market', ({}, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+
+    const r = roll2d6();
+    state.round.marketRoll = r;
+    state.log.push({ t: Date.now(), type: 'ROLL', msg: `Market roll: ${r.d1}+${r.d2}=${r.total}` });
+    cb?.({ ok: true, roll: r });
+    emitState(roomId);
+  });
+
+  socket.on('admin_set_market_roll', ({ d1, d2 }, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+
+    const a = Number(d1), b = Number(d2);
+    if (![a, b].every(x => Number.isInteger(x) && x >= 1 && x <= 6)) {
+      return cb?.({ ok: false, error: 'Invalid dice' });
+    }
+
+    state.round.marketRoll = { d1: a, d2: b, total: a + b };
+    state.log.push({ t: Date.now(), type: 'ROLL', msg: `Market roll set: ${a}+${b}=${a + b}` });
+    cb?.({ ok: true });
+    emitState(roomId);
+  });
+
+  socket.on('admin_resolve_round', ({}, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+    if (!state.round.marketRoll) return cb?.({ ok: false, error: 'Market roll not set' });
+
+    try {
+      // Change 5: since insurance was already deducted from p.money, we must NOT deduct it again in resolveRound.
+      // We pass a flag to tell resolveRound that insurance costs have already been paid.
+      const stateForResolution = deepCopy(state);
+      for (const p of stateForResolution.players) {
+        // Mark insurance as pre-paid so resolveRound doesn't deduct it again
+        if (p.round?.insurancePaid) {
+          p.round._insurancePrePaid = true;
+        }
+        // Research was also pre-paid, so zero out researchPurchases for cost calculation in resolveRound
+        p.round._researchPrePaid = true;
+      }
+      const { state: next, resolution } = resolveRound(stateForResolution, {
+        insurancePrePaid: true,
+        researchPrePaid: true,
+      });
+      rooms.set(roomId, next);
+      cb?.({ ok: true, resolution });
+      emitState(roomId);
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on('admin_end_game', ({}, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+
+    state.game = state.game || {};
+    state.game.isOver = true;
+    state.log.push({ t: Date.now(), type: 'GAME_OVER', msg: 'Game ended by admin' });
+    cb?.({ ok: true });
+    emitState(roomId);
+  });
+
+  socket.on('admin_save', ({}, cb) => {
+    const roomId = socket.data.roomId;
+    const state = rooms.get(roomId);
+    if (!state) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+    cb?.({ ok: true, state });
+  });
+
+  socket.on('admin_load', ({ state }, cb) => {
+    const roomId = socket.data.roomId;
+    const cur = rooms.get(roomId);
+    if (!cur) return cb?.({ ok: false, error: 'Room not found' });
+    if (!socket.data.isAdmin) return cb?.({ ok: false, error: 'Admin only' });
+    if (!state || state.roomId !== roomId) return cb?.({ ok: false, error: 'State roomId mismatch' });
+
+    state.adminSecret = cur.adminSecret;
+    rooms.set(roomId, state);
+
+    cb?.({ ok: true });
+    emitState(roomId);
+  });
+
+  socket.on('disconnect', () => {});
+});
+
+server.listen(PORT, () => {
+  console.log(`The Barons running on port ${PORT}`);
+});
